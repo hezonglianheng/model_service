@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行产物
+logs/
+run/
+.cache/
+.cuda-compat/
+.downloads/
+
+# 本地密钥（不要提交；HF_TOKEN / API_KEY 可直接写在 config.py 或环境变量里）
+.env
+.env.*

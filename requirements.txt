@@ -1,0 +1,11 @@
+# 版本参考。实际安装请执行 setup.sh：torch/vLLM 需要 cu129 专用 wheel 源。
+torch==2.13.0+cu129
+torchvision==0.28.0+cu129
+torchaudio==2.11.0+cu129
+vllm==0.32.0+cu129
+openai>=1.0
+huggingface_hub>=0.30
+# 环境里 ALL_PROXY=socks5://... 时，httpx 需要 socksio
+socksio>=1.0
+# FlashInfer 运行时 JIT（top-k/top-p 采样）需要 ninja 在 PATH 中
+ninja>=1.11
