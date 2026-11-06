@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -14,6 +15,10 @@ import config
 GIB = 1024 ** 3
 # 首次联网加载至少需要这么多空闲磁盘（模型约 55.6GB，留出余量）。
 MIN_FREE_DISK_GIB = 70
+# 无 index.json 时，识别 model-00001-of-00004.safetensors 这类分片名。
+_SHARD_RE = re.compile(
+    r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.(?P<suffix>safetensors|bin)$"
+)
 
 
 def expand_path(p: str | os.PathLike[str]) -> Path:
@@ -135,12 +140,31 @@ def estimate_kv_bytes_per_token(model_cfg: dict[str, Any]) -> int | None:
     return n_full * 2 * kv_heads * head_dim * 2  # 2 = K/V, 最后 2 = BF16 字节
 
 
-def _snapshot_complete(path: str | os.PathLike[str]) -> bool:
-    """检查 snapshot 是否至少包含 config.json 和全部权重分片。"""
-    root = Path(path)
-    if not (root / "config.json").is_file():
-        return False
+def _has_tokenizer(root: Path) -> bool:
+    """识别常见 HF tokenizer 布局，避免把“只有权重”的缓存当成完整快照。"""
+    for name in (
+        "tokenizer.json",
+        "tokenizer.model",
+        "spiece.model",
+        "sentencepiece.bpe.model",
+        "vocab.txt",
+    ):
+        marker = root / name
+        if marker.is_file() and marker.stat().st_size > 0:
+            return True
+    if any(p.is_file() and p.stat().st_size > 0 for p in root.glob("*.tiktoken")):
+        return True
+    vocab = root / "vocab.json"
+    merges = root / "merges.txt"
+    return (
+        vocab.is_file()
+        and vocab.stat().st_size > 0
+        and merges.is_file()
+        and merges.stat().st_size > 0
+    )
 
+
+def _weights_complete(root: Path) -> bool:
     for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
         index_file = root / index_name
         if not index_file.is_file():
@@ -152,10 +176,46 @@ def _snapshot_complete(path: str | os.PathLike[str]) -> bool:
         shards = set((data.get("weight_map") or {}).values())
         if not shards:
             return False
-        return all((root / name).is_file() and (root / name).stat().st_size > 0 for name in shards)
+        return all(
+            (root / name).is_file() and (root / name).stat().st_size > 0 for name in shards
+        )
 
-    weight_files = list(root.glob("*.safetensors")) + list(root.glob("*.bin"))
-    return any(p.is_file() and p.stat().st_size > 0 for p in weight_files)
+    weight_files = [
+        p
+        for p in list(root.glob("*.safetensors")) + list(root.glob("*.bin"))
+        if p.is_file() and p.stat().st_size > 0
+    ]
+    if not weight_files:
+        return False
+
+    # 没有 index.json 时，若文件按分片命名，必须 1..total 全部到齐。
+    # 分组键包含扩展名，避免 .bin 与 .safetensors 的残缺分片互相“补齐”。
+    shard_groups: dict[tuple[str, str, int], set[int]] = {}
+    for path in weight_files:
+        match = _SHARD_RE.match(path.name)
+        if match:
+            key = (match.group("prefix"), match.group("suffix"), int(match.group("total")))
+            shard_groups.setdefault(key, set()).add(int(match.group("index")))
+    for (_prefix, _suffix, total), indices in shard_groups.items():
+        if indices != set(range(1, total + 1)):
+            return False
+    return True
+
+
+def _snapshot_complete(
+    path: str | os.PathLike[str], *, require_tokenizer: bool = True
+) -> bool:
+    """检查 snapshot 是否包含 config.json、完整权重，以及（可选）tokenizer。
+
+    require_tokenizer=True 用于“本地缓存能否直接启动”的快速判断；下载完成或
+    离线校验时传 False，避免未知但合法的 tokenizer 布局被误判为不完整。
+    """
+    root = Path(path)
+    if not (root / "config.json").is_file():
+        return False
+    if require_tokenizer and not _has_tokenizer(root):
+        return False
+    return _weights_complete(root)
 
 
 def _download_snapshot(local_files_only: bool) -> Path:
@@ -226,13 +286,33 @@ def resolve_model_path() -> Path:
                 "`bash download_model.py`，或把 LOCAL_MODEL_PATH 指向完整模型目录。"
                 f"\n原始错误：{exc}"
             ) from exc
-        if not _snapshot_complete(snapshot):
+        if not _snapshot_complete(snapshot, require_tokenizer=False):
             raise RuntimeError(
                 f"缓存 snapshot 不完整：{snapshot}。请联网重新运行 download_model.py。"
             )
+        if not _has_tokenizer(snapshot):
+            print(
+                f"[model] 警告：未在 {snapshot} 中识别到 tokenizer 文件，"
+                "如启动失败请联网补齐缓存",
+                file=sys.stderr,
+            )
         return snapshot
 
+    if config.USE_LOCAL_CACHE_FIRST:
+        # 本地已有完整快照时直接启动，省掉 snapshot_download 的远端 revision 查询。
+        try:
+            cached = _download_snapshot(local_files_only=True)
+        except Exception:
+            cached = None
+        if cached is not None and _snapshot_complete(cached):
+            print(
+                f"[model] 命中本地完整快照，跳过联网检查：{cached}",
+                file=sys.stderr,
+            )
+            return cached
+
     snapshot = _download_snapshot(local_files_only=False)
-    if not _snapshot_complete(snapshot):
+    # 下载刚完成，tokenizer 布局可能超出白名单；这里只校验权重和 config。
+    if not _snapshot_complete(snapshot, require_tokenizer=False):
         raise RuntimeError(f"下载后的 snapshot 不完整：{snapshot}")
     return snapshot

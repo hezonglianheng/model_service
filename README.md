@@ -59,8 +59,10 @@ model_service/
 ├── requirements.txt          # 版本参考（安装以 setup.sh 为准）
 ├── scripts/
 │   ├── chat.py               # OpenAI SDK 示例（流式 / 图片 / thinking）
+│   ├── batch_chat.py         # 并发批处理（多输入 / 每输入 n 个候选）
 │   ├── smoke_test.sh         # /health + /v1/models + 一次 chat
 │   └── fetch_cuda_compat.sh  # 可选：无 sudo 解压 cuda-compat-12-9
+├── tests/                    # 无 GPU / 无第三方依赖的单元测试
 ├── logs/                     # 运行日志（自动创建）
 └── run/                      # PID 文件（自动创建）
 ```
@@ -145,6 +147,7 @@ bash /home/qinyuhang/model_service/service.sh start --wait
 | `MODEL_ID` | `Qwen/Qwen3.8-27B` | HF repo id，或本地模型目录 |
 | `SERVED_MODEL_NAME` | `Qwen/Qwen3.8-27B` | `/v1/models` 与请求里的 `model` 字段 |
 | `ONLINE_LOAD` | `True` | `True` 联网；`False` 只用本地缓存/路径 |
+| `USE_LOCAL_CACHE_FIRST` | `True` | 有完整本地快照时跳过 HF 联网检查，重启更快 |
 | `HF_ENDPOINT` | `https://hf-mirror.com` | 联网加载点，可改回 `https://huggingface.co` |
 | `LOCAL_MODEL_PATH` | `""` | 离线时可显式指定完整模型目录 |
 | `MODEL_CACHE_DIR` | `~/.cache/huggingface/hub` | `snapshot_download` 的缓存目录 |
@@ -163,8 +166,8 @@ bash /home/qinyuhang/model_service/service.sh start --wait
 | `TENSOR_PARALLEL_SIZE` | `"auto"` | 自动等于 `len(GPU_IDS)` |
 | `GPU_MEMORY_UTILIZATION` | `0.90` | 显存占用上限 |
 | `MAX_MODEL_LEN` | `65536` | 自动钳制到模型原生上限 |
-| `MAX_NUM_SEQS` | `8` | 并发序列数 |
-| `MAX_NUM_BATCHED_TOKENS` | `8192` | 单批 token 数 |
+| `MAX_NUM_SEQS` | `8` | 同时在跑的序列上限；短请求可试 `32`，长上下文仍受 KV 限制 |
+| `MAX_NUM_BATCHED_TOKENS` | `8192` | 单批 token 预算；长 prompt 预填充可试 `16384` |
 | `DTYPE` | `"auto"` | Qwen3.8 为 bfloat16 |
 | `KV_CACHE_DTYPE` | `"auto"` | A100 不要用 fp8 |
 | `ENFORCE_EAGER` | `False` | 显存/图捕获异常时改 `True` |
@@ -322,6 +325,54 @@ print(resp.choices[0].message.tool_calls)
 ```
 
 默认每个 prompt 最多 4 张图 / 1 个视频（`LIMIT_MM_PER_PROMPT`）。只看文本时可设 `LANGUAGE_MODEL_ONLY = True` 省显存。
+
+### 6.7 并发 / 批量 / 多输出
+
+并行推理由 vLLM 的 continuous batching 负责，服务端不需要自建线程池或请求队列：
+
+- **服务端容量**：`MAX_NUM_SEQS`（同时在跑的序列上限，默认 8）和 `MAX_NUM_BATCHED_TOKENS`（单批 token 预算，默认 8192）；修改后 `bash service.sh restart --wait`。
+- **长上下文**：并发受 KV cache 限制，64K 请求单卡约 4 路，超出会自动排队而不是 OOM；短请求可把 `MAX_NUM_SEQS` 调到 32 提升吞吐。
+- **单请求多输出**：OpenAI 的 `n` 参数（chat / completions 均支持）；`/v1/completions` 还支持 `prompt` 数组一次提交多个独立输入。
+- **多输入批量**：用 `scripts/batch_chat.py`，共享 HTTP 连接池、`--concurrency` 限制在途请求、结果保持输入顺序。
+
+输入 JSONL，每行一个对象（也接受裸字符串）：
+
+```json
+{"id": "q1", "prompt": "用一句话解释张量并行"}
+{"id": "q2", "messages": [{"role": "user", "content": "写一个快速排序"}], "n": 2}
+{"id": "q3", "prompt": "总结这段文字", "system": "你是编辑", "max_tokens": 256}
+```
+
+```bash
+# 4 路并发；每条输入返回 2 个候选；关闭 thinking
+.venv/bin/python scripts/batch_chat.py \
+  --input prompts.jsonl --output results.jsonl \
+  --concurrency 4 --n 2 --no-thinking
+```
+
+结果 JSONL 与输入同序，每条包含全部 `choices`、`usage`、`elapsed_s`；失败项带 `error`，不会中断整批。全部成功退出码为 0，有失败为 1。默认单条重试 2 次（指数退避），`--retries 0` 可关闭。
+
+`messages` 表示完全透传，不能与同一条的 `prompt` / `system` 同时出现；`--system` 只对 `prompt` 输入生效。缓存优先启动时，若需发现 HF 远端更新，把 `USE_LOCAL_CACHE_FIRST` 设为 `False` 再重启。
+
+### 6.8 提速要点
+
+已默认开启、通常不用改：
+
+- continuous batching / chunked prefill（vLLM 调度器）；
+- 前缀缓存（`ENABLE_PREFIX_CACHING = True`）；
+- CUDA graph（`ENFORCE_EAGER = False`）；
+- 本地缓存优先启动（`USE_LOCAL_CACHE_FIRST = True`），重启时跳过 HF 联网检查。
+
+可调项：
+
+| 场景 | 建议 |
+| --- | --- |
+| 大量短请求 | 提高 `MAX_NUM_SEQS`（如 32），客户端 `--concurrency` 与之匹配 |
+| 长 prompt 预填充慢 | 适当提高 `MAX_NUM_BATCHED_TOKENS`（如 16384），观察显存峰值 |
+| 客户端串行调用 | 用 `batch_chat.py` 并发 4~8 路，复用连接池 |
+| 启动慢 | 保持 `USE_LOCAL_CACHE_FIRST=True` 和 `VLLM_CACHE_ROOT` 编译缓存 |
+
+用 `batch_chat.py` 输出末尾的“请求/s、输出 token/s”对比调整效果；没有 GPU 的机器只能跑单元测试，吞吐必须在目标机上实测。
 
 ---
 
