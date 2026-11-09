@@ -56,8 +56,11 @@ MAX_MODEL_LEN = 65536
 # 并发序列数 / 单批 token 数；显存紧张时调小。
 # MAX_NUM_SEQS 是同时在跑的序列上限：短请求吞吐可试 32；
 # 长上下文仍受 KV cache 约束（64K 请求实测约 4 路，vLLM 会自动排队而不是 OOM）。
-MAX_NUM_SEQS = 8
+# MAX_NUM_SEQS = 8
+MAX_NUM_SEQS = 32
+# 单批 token 预算：长 prompt 预填充可试 16384；短筛选请求保持 8192 更稳。
 MAX_NUM_BATCHED_TOKENS = 8192
+# MAX_NUM_BATCHED_TOKENS = 16384
 # 显存/图捕获失败时打开（禁用 CUDA graph）。
 ENFORCE_EAGER = False
 

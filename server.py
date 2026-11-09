@@ -94,6 +94,13 @@ def validate_config() -> None:
     if isinstance(config.MAX_MODEL_LEN, str) and config.MAX_MODEL_LEN != "auto":
         raise SystemExit(f"config.MAX_MODEL_LEN 必须是正整数或 'auto'，当前为 {config.MAX_MODEL_LEN!r}")
 
+    for name in ("MAX_NUM_SEQS", "MAX_NUM_BATCHED_TOKENS"):
+        value = getattr(config, name, None)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise SystemExit(f"config.{name} 必须是正整数或 None，当前为 {value!r}")
+
     if str(config.KV_CACHE_DTYPE).startswith("fp8"):
         caps = query_compute_caps()
         selected = [caps.get(i) for i in config.GPU_IDS if i in caps]
