@@ -82,9 +82,11 @@ def main() -> int:
         return 1
 
     total, count = snapshot_size(path)
+    tokenizer = "已识别" if model_utils.has_tokenizer(path) else "未识别（启动时请确认）"
     print(f"[download] 模型目录：{path}")
     print(f"[download] 文件数：{count}，总大小：{human_size(total)}")
-    print("[download] 校验通过：config.json 与权重分片齐全")
+    print(f"[download] tokenizer：{tokenizer}")
+    print("[download] 结构校验通过：config.json 与权重分片齐全（未做权重内容哈希）")
     return 0
 
 

@@ -19,6 +19,16 @@ MIN_FREE_DISK_GIB = 70
 _SHARD_RE = re.compile(
     r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.(?P<suffix>safetensors|bin)$"
 )
+# 训练/适配器产物也常是 .bin/.safetensors，不能单独证明“模型权重完整”。
+_NON_MODEL_WEIGHT_PREFIXES = (
+    "training_args",
+    "optimizer",
+    "scheduler",
+    "rng_state",
+    "trainer_state",
+    "adapter_model",
+    "adapter_layer",
+)
 
 
 def expand_path(p: str | os.PathLike[str]) -> Path:
@@ -164,6 +174,11 @@ def _has_tokenizer(root: Path) -> bool:
     )
 
 
+def has_tokenizer(path: str | os.PathLike[str]) -> bool:
+    """目录中是否存在可识别的 tokenizer 文件（供下载检查/启动日志复用）。"""
+    return _has_tokenizer(Path(path))
+
+
 def _weights_complete(root: Path) -> bool:
     for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
         index_file = root / index_name
@@ -180,10 +195,17 @@ def _weights_complete(root: Path) -> bool:
             (root / name).is_file() and (root / name).stat().st_size > 0 for name in shards
         )
 
+    def is_weight_candidate(path: Path) -> bool:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        if path.name.lower().startswith(_NON_MODEL_WEIGHT_PREFIXES):
+            return False
+        return path.suffix in (".safetensors", ".bin")
+
     weight_files = [
         p
         for p in list(root.glob("*.safetensors")) + list(root.glob("*.bin"))
-        if p.is_file() and p.stat().st_size > 0
+        if is_weight_candidate(p)
     ]
     if not weight_files:
         return False
@@ -216,6 +238,38 @@ def _snapshot_complete(
     if require_tokenizer and not _has_tokenizer(root):
         return False
     return _weights_complete(root)
+
+
+def _warn_missing_tokenizer(root: Path) -> None:
+    if not _has_tokenizer(root):
+        print(
+            f"[model] 警告：{root} 中未识别到常见 tokenizer 文件；"
+            "如 vLLM 启动失败，请补齐 tokenizer",
+            file=sys.stderr,
+        )
+
+
+def validate_local_model_dir(
+    path: str | os.PathLike[str],
+    *,
+    source: str = "本地模型目录",
+    require_tokenizer: bool = False,
+) -> Path:
+    """校验显式指定的本地模型目录，避免把残缺目录当成“可直接启动”。
+
+    只做启动前的轻量结构检查：config.json、权重分片是否齐全；不会读约 55GB 权重
+    做内容哈希。tokenizer 不在常见白名单里时只警告，因为自定义布局仍可能是合法的。
+    """
+    root = Path(path)
+    if not root.is_dir():
+        raise FileNotFoundError(f"{source}不存在：{root}")
+    if not _snapshot_complete(root, require_tokenizer=require_tokenizer):
+        raise RuntimeError(
+            f"{source}不完整：{root}；需要 config.json 和完整权重分片"
+            "（有 index.json 时按 weight_map 校验，无 index 时按分片编号校验）"
+        )
+    _warn_missing_tokenizer(root)
+    return root
 
 
 def _download_snapshot(local_files_only: bool) -> Path:
@@ -262,12 +316,12 @@ def resolve_model_path() -> Path:
     """
     model_id_path = expand_path(config.MODEL_ID)
     if model_id_path.is_dir():
-        return model_id_path
+        return validate_local_model_dir(model_id_path, source="MODEL_ID 指向的本地目录")
 
     if config.LOCAL_MODEL_PATH:
         local_path = expand_path(config.LOCAL_MODEL_PATH)
         if local_path.is_dir():
-            return local_path
+            return validate_local_model_dir(local_path, source="LOCAL_MODEL_PATH")
         if not config.ONLINE_LOAD:
             raise FileNotFoundError(
                 f"ONLINE_LOAD=False 且 LOCAL_MODEL_PATH 不存在：{local_path}"
@@ -290,21 +344,18 @@ def resolve_model_path() -> Path:
             raise RuntimeError(
                 f"缓存 snapshot 不完整：{snapshot}。请联网重新运行 download_model.py。"
             )
-        if not _has_tokenizer(snapshot):
-            print(
-                f"[model] 警告：未在 {snapshot} 中识别到 tokenizer 文件，"
-                "如启动失败请联网补齐缓存",
-                file=sys.stderr,
-            )
+        _warn_missing_tokenizer(snapshot)
         return snapshot
 
     if config.USE_LOCAL_CACHE_FIRST:
         # 本地已有完整快照时直接启动，省掉 snapshot_download 的远端 revision 查询。
+        # tokenizer 与离线分支同一策略：未识别常见布局时只警告，不因此强制联网。
         try:
             cached = _download_snapshot(local_files_only=True)
         except Exception:
             cached = None
-        if cached is not None and _snapshot_complete(cached):
+        if cached is not None and _snapshot_complete(cached, require_tokenizer=False):
+            _warn_missing_tokenizer(cached)
             print(
                 f"[model] 命中本地完整快照，跳过联网检查：{cached}",
                 file=sys.stderr,
@@ -315,4 +366,5 @@ def resolve_model_path() -> Path:
     # 下载刚完成，tokenizer 布局可能超出白名单；这里只校验权重和 config。
     if not _snapshot_complete(snapshot, require_tokenizer=False):
         raise RuntimeError(f"下载后的 snapshot 不完整：{snapshot}")
+    _warn_missing_tokenizer(snapshot)
     return snapshot
