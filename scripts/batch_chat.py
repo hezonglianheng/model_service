@@ -32,6 +32,57 @@ from typing import Any, Callable, IO
 DEFAULT_BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000/v1")
 DEFAULT_MODEL = os.environ.get("MODEL", "Qwen/Qwen3.8-27B")
 
+_RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_NON_RETRYABLE_STATUS = frozenset({400, 401, 403, 404, 405, 422})
+
+
+def _status_code(exc: BaseException) -> int | None:
+    """从 SDK 异常或 response 上取 HTTP 状态码。"""
+    for attr in ("status_code", "http_status", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    """只有超时、连接失败、限流和可恢复 5xx 才值得重试。
+
+    400/401/403/404/422 这类配置错误重试不会变好，立即返回失败，避免把一次
+    明确错误拖成多次请求。
+    """
+    status = _status_code(exc)
+    if status in _NON_RETRYABLE_STATUS:
+        return False
+    if status in _RETRYABLE_STATUS:
+        return True
+    # 已知状态码但不在白名单（例如 501 Not Implemented）不要再用异常类名兜底：
+    # 重试不会让服务端支持一个未实现的能力。
+    if status is not None:
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    name = type(exc).__name__.lower()
+    for marker in (
+        "timeout",
+        "timedout",
+        "connection",
+        "connecterror",
+        "ratelimit",
+        "internalserver",
+        "serviceunavailable",
+        "overloaded",
+        "transport",
+    ):
+        if marker in name:
+            return True
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text or "connection reset" in text
+
 
 def get_reasoning(message: Any) -> str | None:
     """兼容 vLLM 新旧字段：0.32 起用 reasoning，旧版本用 reasoning_content。"""
@@ -218,8 +269,10 @@ async def run_batch(
                     return make_result(item, response, time.perf_counter() - started)
                 except Exception as exc:  # 单条请求失败不应中断整批
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < retries and is_retryable_error(exc):
                         await asyncio.sleep(retry_backoff * (2**attempt))
+                        continue
+                    break
 
             return {
                 "id": item["id"],
@@ -228,6 +281,16 @@ async def run_batch(
             }
 
     return list(await asyncio.gather(*(run_one(item) for item in items)))
+
+
+async def run_with_client(client: Any, items: list[dict[str, Any]], **kwargs: Any) -> list[dict[str, Any]]:
+    """执行一批请求，并保证成功、异常、取消时都关闭异步客户端。"""
+    try:
+        return await run_batch(client, items, **kwargs)
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            await close()
 
 
 def write_results(results: list[dict[str, Any]], output: IO[str]) -> None:
@@ -291,6 +354,12 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--concurrency 必须 >= 1")
     if args.n < 1:
         raise SystemExit("--n 必须 >= 1")
+    if args.max_tokens < 1:
+        raise SystemExit("--max-tokens 必须 >= 1")
+    if args.timeout <= 0:
+        raise SystemExit("--timeout 必须 > 0")
+    if args.retry_backoff < 0:
+        raise SystemExit("--retry-backoff 必须 >= 0")
 
     try:
         from openai import AsyncOpenAI
@@ -319,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.perf_counter()
     results = asyncio.run(
-        run_batch(
+        run_with_client(
             client,
             items,
             concurrency=args.concurrency,
