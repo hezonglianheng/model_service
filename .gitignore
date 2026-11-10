@@ -19,3 +19,5 @@ run/
 
 # 测试文件
 tests/
+deployment_tests/
+docs/
