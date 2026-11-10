@@ -1,7 +1,7 @@
 """Qwen3.8-27B 本地推理服务配置。
 
 所有可调项集中在这里；修改后重启服务即可生效。
-默认值：联网从 https://hf-mirror.com 加载，使用物理卡 1，监听 127.0.0.1:8000。
+默认值：联网从 https://hf-mirror.com 加载，每张合格 GPU 一个副本，监听 127.0.0.1:8000。
 """
 
 from pathlib import Path
@@ -42,16 +42,30 @@ HF_TOKEN = None
 TRUST_REMOTE_CODE = True
 
 # ============================ GPU ============================
-# 物理卡号（nvidia-smi 的 0-based 编号）。默认 [1] = 第二张卡（编号 1）。
-# 多卡示例：[0, 1]；张量并行数自动等于列表长度。
-GPU_IDS = [1]
-# "auto" = len(GPU_IDS)；也可显式写整数（必须与 GPU_IDS 数量一致）。
-TENSOR_PARALLEL_SIZE = "auto"
-# 单卡显存占用上限。A100 80GB + BF16 27B 建议 0.90。
+# "auto" 检查所有可见 GPU；也可用物理编号白名单，如 [0, 1]。
+# 同时尊重启动环境 CUDA_VISIBLE_DEVICES；实际子进程用 UUID 绑定卡。
+GPU_IDS = "auto"
+# 每张卡放一份完整模型，固定 TP=1；不再按 GPU_IDS 长度开启 TP。
+TENSOR_PARALLEL_SIZE = 1
+# 每卡预算上限；空闲不足时自动降低（vLLM 按总显存计算此比例）。
 GPU_MEMORY_UTILIZATION = 0.90
+GPU_FREE_MEMORY_RESERVE_GIB = 2.0
+MIN_NUM_SEQS = 1
+WEIGHT_MEMORY_MARGIN = 1.05
+MIN_KV_CACHE_GIB = 4.0
+# 估算运行时/图捕获预留；不是精确峰值，最终必须通过真实加载。
+RUNTIME_MEMORY_GIB = 4.0
+RUNTIME_MEMORY_PER_SEQ_MIB = 64
+# 模型族 MODEL_PROFILES 中的 resources 可给默认值；这里优先级最高。
+# 支持 weights_gib, kv_bytes_per_token, state_bytes_per_seq,
+# runtime_memory_gib, runtime_memory_per_seq_mib, min_compute_capability。
+# 未知架构/量化需用实测值覆盖，不能按模型名称猜显存。
+RESOURCE_OVERRIDES = {}
+# 相同 max_num_seqs 下的相对处理能力，按物理 GPU 编号设置；默认 1。
+GPU_ROUTING_WEIGHTS = {}
 
 # 上下文长度。默认 64K（单卡 A100 80GB 的稳妥值）；
-# 128K 可试 131072；原生 262144 在单卡上很紧张，建议两卡 TP2。
+# 所有副本保持相同上下文，不足的卡减并发或跳过；不会自动缩短上下文。
 MAX_MODEL_LEN = 65536
 # 并发序列数 / 单批 token 数；显存紧张时调小。
 # MAX_NUM_SEQS 是同时在跑的序列上限：短请求吞吐可试 32；
@@ -65,6 +79,7 @@ MAX_NUM_BATCHED_TOKENS = 8192
 ENFORCE_EAGER = False
 
 # "auto" 由模型 config 决定（Qwen3.8 为 bfloat16）。
+# 规划器会统一解析成具体精度，并显式下发给所有副本，避免各卡自行选择不同 dtype。
 DTYPE = "auto"
 # A100 是 SM80，不支持 vLLM 的 fp8 KV cache；请保持 auto/bfloat16。
 KV_CACHE_DTYPE = "auto"
@@ -72,9 +87,22 @@ KV_CACHE_DTYPE = "auto"
 # ============================ 服务 ============================
 HOST = "127.0.0.1"
 PORT = 8000
-# 设置后 /v1、/v2、/inference 需要 Bearer key；None 表示不鉴权。
+# 设置后除 /health 外的网关请求需要 Bearer key；None 表示不鉴权。
+# 副本 vLLM 使用同一 key，supervisor 的健康探测也会携带它。
 API_KEY = None
 UVICORN_LOG_LEVEL = "info"
+# 外部统一 PORT；内部副本从此端口依次分配，只监听 127.0.0.1。
+BACKEND_PORT_START = 8100
+REPLICA_STARTUP_TIMEOUT = 1800
+REPLICA_HEALTH_INTERVAL = 5.0
+REPLICA_HEALTH_TIMEOUT = 3.0
+REPLICA_SHUTDOWN_TIMEOUT = 20.0
+# supervisor 被强杀时，副本守护进程先等 vLLM 自行退出的秒数，然后强杀整个进程组。
+REPLICA_CHILD_GRACE_SECONDS = 15.0
+# 连接已建立后的超时不重放请求；流式也使用此空闲读取超时。
+PROXY_CONNECT_TIMEOUT = 5.0
+PROXY_READ_TIMEOUT = 600.0
+PROXY_MAX_BODY_MIB = 64
 # 官方 recipe 建议开启的 Rust 前端；如遇兼容问题可改 False。
 USE_RUST_FRONTEND = True
 
