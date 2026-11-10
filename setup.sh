@@ -104,8 +104,8 @@ else
   fi
 fi
 
-log "安装客户端依赖（openai / huggingface_hub / socksio / ninja）"
-"${PIP[@]}" "openai>=1.0" "huggingface_hub>=0.30" "socksio>=1.0" "ninja>=1.11"
+log "安装客户端与网关依赖（openai / huggingface_hub / socksio / ninja / aiohttp）"
+"${PIP[@]}" "openai>=1.0" "huggingface_hub>=0.30" "socksio>=1.0" "ninja>=1.11" "aiohttp>=3.10,<4"
 
 log "预下载 vLLM 预编译 kernel（失败不影响启动）"
 if [[ "${SKIP_KERNELS:-0}" == "1" ]]; then
@@ -122,30 +122,45 @@ print(f"torch={torch.__version__} (CUDA {torch.version.cuda})")
 print(f"vllm={vllm.__version__}")
 PY
 
-log "CUDA / BF16 冒烟测试（使用 config.GPU_IDS）"
-GPU_IDS="$("$PY" - <<'PY'
-import config
-print(",".join(str(x) for x in config.GPU_IDS))
-PY
-)"
+log "CUDA 冒烟测试（可见 GPU，逐卡检查）"
 set +e
-CUDA_VISIBLE_DEVICES="$GPU_IDS" "$PY" - <<'PY'
+"$PY" - <<'PY'
+import os
 import sys
+import config
+from gpu_planner import discover_gpus, visible_gpu_uuids
+from server import build_env
+
+os.environ.update(build_env())
+gpus = discover_gpus()
+visible = visible_gpu_uuids(gpus)
+selected = [g for g in gpus if (config.GPU_IDS == "auto" or g.index in config.GPU_IDS)
+            and not g.mig_enabled and (visible is None or g.uuid.lower() in visible)]
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(g.uuid for g in selected)
 import torch
 
 if not torch.cuda.is_available():
     print("torch.cuda.is_available() = False", file=sys.stderr)
     sys.exit(2)
 
-count = torch.cuda.device_count()
-name = torch.cuda.get_device_name(0)
-cap = torch.cuda.get_device_capability(0)
-print(f"可见 GPU 数：{count}，设备 0：{name}，compute capability {cap[0]}.{cap[1]}")
-
-a = torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16)
-b = a @ a
-torch.cuda.synchronize()
-print(f"bf16 matmul OK，结果均值 {b.float().abs().mean().item():.4f}")
+passed = 0
+for index in range(torch.cuda.device_count()):
+    try:
+        with torch.cuda.device(index):
+            cap = torch.cuda.get_device_capability(index)
+            dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+            print(f"设备 {index}: {torch.cuda.get_device_name(index)}, SM{cap}, {dtype}")
+            a = torch.randn(256, 256, device=f"cuda:{index}", dtype=dtype)
+            b = a @ a
+            torch.cuda.synchronize()
+            print(f"matmul OK，结果均值 {b.float().abs().mean().item():.4f}")
+            del a, b
+            torch.cuda.empty_cache()
+            passed += 1
+    except Exception as exc:
+        print(f"设备 {index} 冒烟失败：{exc}", file=sys.stderr)
+if not passed:
+    sys.exit(2)
 PY
 SMOKE_RC=$?
 set -e

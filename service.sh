@@ -15,7 +15,8 @@ mkdir -p "$RUN_DIR" "$LOG_DIR"
 
 BASE_URL="$("$PY" - <<'PY' 2>/dev/null || echo "http://127.0.0.1:8000"
 import config
-print(f"http://{config.HOST}:{config.PORT}")
+host = "127.0.0.1" if config.HOST == "0.0.0.0" else config.HOST
+print(f"http://{host}:{config.PORT}")
 PY
 )"
 
@@ -42,7 +43,29 @@ is_our_process() {
 }
 
 health_ok() {
-  curl -fsS --max-time 3 "$BASE_URL/health" >/dev/null 2>&1
+  curl --noproxy '*' -fsS --max-time 3 "$BASE_URL/health" >/dev/null 2>&1
+}
+
+show_replicas() {
+  "$PY" - <<'PY' || true
+import json
+import urllib.request
+import config
+host = "127.0.0.1" if config.HOST == "0.0.0.0" else config.HOST
+headers = {"Authorization": f"Bearer {config.API_KEY}"} if config.API_KEY else {}
+req = urllib.request.Request(f"http://{host}:{config.PORT}/replicas", headers=headers)
+try:
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=3) as response:
+        data = json.load(response)
+    for b in data["backends"]:
+        print(f"  {b['name']}: {b['state']}, healthy={b['healthy']}, "
+              f"inflight={b['inflight']}, completed={b['completed']}")
+    for g in data["gpus"]:
+        if not g["eligible"]:
+            print(f"  GPU {g['gpu']} skipped: {g['reason']}")
+except Exception as exc:
+    print(f"  副本详情暂不可用：{exc}")
+PY
 }
 
 wait_ready() {
@@ -61,7 +84,8 @@ wait_ready() {
       return 1
     fi
     if health_ok; then
-      log "服务已就绪：$BASE_URL"
+      log "服务已就绪（至少一个副本健康）：$BASE_URL"
+      show_replicas
       return 0
     fi
     # 首次启动可能要先下载 55GB 模型；只要日志还在增长就继续等
@@ -148,7 +172,7 @@ cmd_stop() {
     die "PID $pid 不属于本服务，拒绝发送信号。请人工检查 /proc/$pid/cmdline 后删除 $PID_FILE"
   fi
 
-  log "发送 SIGINT（PID $pid），等待优雅退出..."
+  log "发送 SIGINT（supervisor PID $pid），等待网关和所有副本退出..."
   kill -INT "$pid" 2>/dev/null || true
   for _ in $(seq 1 45); do
     pid_alive "$pid" || { rm -f "$PID_FILE"; log "已停止"; return 0; }
@@ -162,11 +186,11 @@ cmd_stop() {
     sleep 1
   done
 
-  log "仍未退出，发送 SIGKILL"
+  log "仍未退出，发送 SIGKILL 给 supervisor；副本守护进程将按 REPLICA_CHILD_GRACE_SECONDS 回收 GPU 进程"
   kill -KILL "$pid" 2>/dev/null || true
   sleep 1
   rm -f "$PID_FILE"
-  log "已强制停止"
+  log "已强制停止 supervisor（副本清理可能仍在进行，见 logs/gpu-*.log）"
 }
 
 cmd_restart() {
@@ -185,6 +209,7 @@ cmd_status() {
   fi
   if health_ok; then
     log "状态：运行中（PID $pid），$BASE_URL/health 正常"
+    show_replicas
     return 0
   fi
   log "状态：进程存活（PID $pid），但健康检查未通过（可能仍在加载模型）"

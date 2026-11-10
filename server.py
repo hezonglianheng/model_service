@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """配置驱动的 vLLM 启动器。
 
-流程：读取 config.py -> 设置 HF/CUDA 环境 -> 解析/下载模型 -> 组装
-`vllm serve` 参数 -> os.execvpe 交给 vLLM（PID、信号、日志直通）。
+流程：读取模型配置与权重 -> 探测所有 GPU -> 每卡独立 vLLM -> 统一异步网关。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import math
 import os
 import shlex
 import shutil
+import signal
 import socket
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ else:
         os.environ.pop(_key, None)
 
 import model_utils  # noqa: E402
+import gpu_planner  # noqa: E402
 
 
 def log(msg: str) -> None:
@@ -71,17 +73,37 @@ def find_vllm_bin() -> str:
     )
 
 
-def validate_config() -> None:
-    if not isinstance(config.GPU_IDS, (list, tuple)) or not config.GPU_IDS:
-        raise SystemExit("config.GPU_IDS 必须是非空列表，例如 [1]")
-    if not all(isinstance(x, int) and x >= 0 for x in config.GPU_IDS):
-        raise SystemExit(f"config.GPU_IDS 必须是非负整数列表，当前为 {config.GPU_IDS!r}")
-    if len(set(config.GPU_IDS)) != len(config.GPU_IDS):
-        raise SystemExit(f"config.GPU_IDS 有重复项：{config.GPU_IDS!r}")
+def _extra_arg_root(arg: Any) -> str:
+    """按 vLLM FlexibleArgumentParser 的规则得到受保护参数根名。
 
-    tp = tensor_parallel_size()
-    if tp < 1:
-        raise SystemExit(f"tensor parallel size 非法：{tp}")
+    vLLM 会把 ``--max_num_seqs`` 规范成 ``--max-num-seqs``，并把
+    ``--hf-overrides.text_config.x`` 合并进 ``--hf-overrides``。
+    """
+    flag = str(arg).split("=", 1)[0]
+    if flag.startswith("--"):
+        flag = "--" + flag[2:].split(".", 1)[0].replace("_", "-")
+    return flag
+
+
+def _is_reserved_extra(flag: str, reserved: set[str]) -> bool:
+    """同时拦截 argparse 的长参数缩写和短参数连写。"""
+    if flag in reserved or flag.startswith(("--data-parallel", "--pipeline-parallel")):
+        return True
+    if flag.startswith("--"):
+        return any(name.startswith(flag) for name in reserved if name.startswith("--"))
+    return any(name.startswith("-") and not name.startswith("--") and flag.startswith(name)
+               for name in reserved)
+
+
+def validate_config() -> None:
+    if config.GPU_IDS != "auto":
+        if not isinstance(config.GPU_IDS, (list, tuple)) or not config.GPU_IDS:
+            raise SystemExit("config.GPU_IDS 必须是 'auto' 或非空物理 GPU 编号列表")
+        if not all(type(x) is int and x >= 0 for x in config.GPU_IDS):
+            raise SystemExit("config.GPU_IDS 必须是非负整数列表")
+        if len(set(config.GPU_IDS)) != len(config.GPU_IDS):
+            raise SystemExit("config.GPU_IDS 有重复项")
+    tensor_parallel_size()
 
     if not (0.05 <= float(config.GPU_MEMORY_UTILIZATION) <= 0.98):
         raise SystemExit(
@@ -94,92 +116,62 @@ def validate_config() -> None:
     if isinstance(config.MAX_MODEL_LEN, str) and config.MAX_MODEL_LEN != "auto":
         raise SystemExit(f"config.MAX_MODEL_LEN 必须是正整数或 'auto'，当前为 {config.MAX_MODEL_LEN!r}")
 
-    for name in ("MAX_NUM_SEQS", "MAX_NUM_BATCHED_TOKENS"):
+    for name in ("MAX_NUM_SEQS", "MIN_NUM_SEQS", "MAX_NUM_BATCHED_TOKENS", "PROXY_MAX_BODY_MIB"):
         value = getattr(config, name, None)
-        if value is None:
+        if value is None and name == "MAX_NUM_BATCHED_TOKENS":
             continue
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise SystemExit(f"config.{name} 必须是正整数或 None，当前为 {value!r}")
 
-    if str(config.KV_CACHE_DTYPE).startswith("fp8"):
-        caps = query_compute_caps()
-        selected = [caps.get(i) for i in config.GPU_IDS if i in caps]
-        if selected and any(cap is not None and cap < 8.9 for cap in selected):
-            log(
-                "警告：A100（SM80）不支持 vLLM 的 fp8 KV cache，"
-                "请把 config.KV_CACHE_DTYPE 改回 'auto'/'bfloat16'"
-            )
+    if config.MIN_NUM_SEQS > config.MAX_NUM_SEQS:
+        raise SystemExit("MIN_NUM_SEQS 不能超过 MAX_NUM_SEQS")
+    if not 0 < config.BACKEND_PORT_START < 65536:
+        raise SystemExit("BACKEND_PORT_START 非法")
+    for name in ("GPU_FREE_MEMORY_RESERVE_GIB", "MIN_KV_CACHE_GIB", "RUNTIME_MEMORY_GIB",
+                 "RUNTIME_MEMORY_PER_SEQ_MIB", "WEIGHT_MEMORY_MARGIN", "REPLICA_STARTUP_TIMEOUT",
+                 "REPLICA_HEALTH_INTERVAL", "REPLICA_HEALTH_TIMEOUT", "REPLICA_SHUTDOWN_TIMEOUT",
+                 "REPLICA_CHILD_GRACE_SECONDS", "PROXY_CONNECT_TIMEOUT", "PROXY_READ_TIMEOUT"):
+        value = getattr(config, name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise SystemExit(f"config.{name} 必须是有限非负数")
+        if ("TIMEOUT" in name or "INTERVAL" in name) and value == 0:
+            raise SystemExit(f"config.{name} 必须大于 0")
+    if config.WEIGHT_MEMORY_MARGIN < 1:
+        raise SystemExit("WEIGHT_MEMORY_MARGIN 不能小于 1")
+    for name in ("RESOURCE_OVERRIDES", "GPU_ROUTING_WEIGHTS", "MODEL_PROFILES",
+                 "EXTRA_ENV", "LIMIT_MM_PER_PROMPT"):
+        if not isinstance(getattr(config, name), dict):
+            raise SystemExit(f"config.{name} 必须是 dict")
+
+    reserved = {"--host", "--port", "--config", "--model", "--served-model-name", "--api-key",
+                "--tensor-parallel-size", "-tp", "-pp", "-dp", "-dpl", "-dpr", "-dpn",
+                "--max-model-len", "--max-num-seqs", "--max-num-batched-tokens",
+                "--gpu-memory-utilization", "--kv-cache-memory-bytes", "--kv-cache-dtype",
+                "--dtype", "--quantization", "-q", "--hf-overrides", "--speculative-config",
+                "--num-gpu-blocks-override", "--cpu-offload-gb", "--distributed-executor-backend",
+                "--data-parallel-size", "--pipeline-parallel-size"}
+    for arg in config.EXTRA_VLLM_ARGS:
+        flag = _extra_arg_root(arg)
+        if _is_reserved_extra(flag, reserved):
+            raise SystemExit(f"EXTRA_VLLM_ARGS 不得覆盖自动规划参数 {flag}；请使用 config.py 对应配置")
+    for key in config.EXTRA_ENV:
+        if key in {"CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"} or key.startswith("VLLM_DP_"):
+            raise SystemExit(f"EXTRA_ENV 不得覆盖副本设备/拓扑：{key}")
 
 
 def tensor_parallel_size() -> int:
     value = config.TENSOR_PARALLEL_SIZE
-    if value in (None, "", "auto"):
-        return len(config.GPU_IDS)
-    tp = int(value)
-    if tp != len(config.GPU_IDS):
-        raise SystemExit(
-            f"config.TENSOR_PARALLEL_SIZE={tp} 与 GPU_IDS 数量 "
-            f"{len(config.GPU_IDS)} 不一致；多卡请把卡号都写进 GPU_IDS"
-        )
-    return tp
-
-
-def _nvidia_smi(query: str) -> str | None:
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if out.returncode != 0:
-            return None
-        return out.stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def query_gpu_indices() -> set[int] | None:
-    out = _nvidia_smi("index")
-    if out is None:
-        return None
-    try:
-        return {int(line.strip().split(",")[0]) for line in out.splitlines() if line.strip()}
-    except ValueError:
-        return None
-
-
-def query_compute_caps() -> dict[int, float]:
-    out = _nvidia_smi("index,compute_cap")
-    if out is None:
-        return {}
-    caps: dict[int, float] = {}
-    for line in out.splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 2:
-            try:
-                caps[int(parts[0])] = float(parts[1])
-            except ValueError:
-                continue
-    return caps
-
-
-def validate_gpu_ids() -> None:
-    available = query_gpu_indices()
-    if available is None:
-        log("警告：无法执行 nvidia-smi，跳过 GPU 编号校验")
-        return
-    missing = [i for i in config.GPU_IDS if i not in available]
-    if missing:
-        raise SystemExit(
-            f"config.GPU_IDS={config.GPU_IDS} 中有本机不存在的卡：{missing}；"
-            f"nvidia-smi 可见编号为 {sorted(available)}"
-        )
+    if value not in (None, "", "auto", 1):
+        raise SystemExit("独立副本模式要求 TENSOR_PARALLEL_SIZE=1；每卡加载完整模型")
+    return 1
 
 
 def validate_port() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if os.name == "posix":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        elif hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         try:
             sock.bind((config.HOST, int(config.PORT)))
         except OSError as exc:
@@ -203,9 +195,10 @@ def find_compat_dir(root: Path) -> Path:
     )
 
 
-def build_env() -> dict[str, str]:
+def build_env(*, replica: gpu_planner.GPUDecision | None = None) -> dict[str, str]:
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in config.GPU_IDS)
+    if replica is not None:
+        env["CUDA_VISIBLE_DEVICES"] = replica.gpu.uuid
     if config.HF_ENDPOINT:
         env["HF_ENDPOINT"] = config.HF_ENDPOINT
     else:
@@ -217,6 +210,9 @@ def build_env() -> dict[str, str]:
         env["HF_TOKEN"] = str(config.HF_TOKEN)
         env["HUGGING_FACE_HUB_TOKEN"] = str(config.HF_TOKEN)
     env["VLLM_CACHE_ROOT"] = str(config.VLLM_CACHE_ROOT)
+    if replica is not None:
+        # 同机多副本并行首次启动时避免共享编译缓存产生竞争；代价是每卡独立缓存。
+        env["VLLM_CACHE_ROOT"] = str(Path(config.VLLM_CACHE_ROOT) / f"gpu-{replica.gpu.index}")
     env["VLLM_NO_USAGE_STATS"] = "1"
     env["DO_NOT_TRACK"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
@@ -257,9 +253,15 @@ def resolve_auto_flag(name: str, model_cfg: dict[str, Any], profile: dict[str, A
     return profile.get(name.lower()) or None
 
 
-def build_argv(vllm_bin: str, model_path: Path, model_cfg: dict[str, Any]) -> list[str]:
+def build_argv(vllm_bin: str, model_path: Path, model_cfg: dict[str, Any], *,
+               replica: gpu_planner.GPUDecision | None = None, port: int | None = None,
+               resolved_dtype: str | None = None) -> list[str]:
+    model_cfg = gpu_planner.effective_model_config(model_cfg)
     tp = tensor_parallel_size()
-    max_len = model_utils.clamp_max_model_len(model_cfg)
+    max_len = replica.max_model_len if replica else model_utils.clamp_max_model_len(model_cfg)
+    utilization = replica.memory_utilization if replica else config.GPU_MEMORY_UTILIZATION
+    seqs = replica.max_num_seqs if replica else config.MAX_NUM_SEQS
+    dtype = resolved_dtype or config.DTYPE
     profile = model_utils.infer_model_profile(model_cfg)
     has_vision = model_utils.is_multimodal(model_cfg)
 
@@ -274,25 +276,25 @@ def build_argv(vllm_bin: str, model_path: Path, model_cfg: dict[str, Any]) -> li
         "serve",
         str(model_path),
         "--host",
-        config.HOST,
+        "127.0.0.1" if replica else config.HOST,
         "--port",
-        str(config.PORT),
+        str(port if port is not None else config.PORT),
         "--served-model-name",
         config.SERVED_MODEL_NAME,
         "--tensor-parallel-size",
         str(tp),
         "--gpu-memory-utilization",
-        str(config.GPU_MEMORY_UTILIZATION),
+        str(utilization),
         "--dtype",
-        config.DTYPE,
+        dtype,
         "--uvicorn-log-level",
         config.UVICORN_LOG_LEVEL,
     ]
 
     if max_len:
         argv += ["--max-model-len", str(max_len)]
-    if config.MAX_NUM_SEQS is not None:
-        argv += ["--max-num-seqs", str(config.MAX_NUM_SEQS)]
+    if seqs is not None:
+        argv += ["--max-num-seqs", str(seqs)]
     if config.MAX_NUM_BATCHED_TOKENS is not None:
         argv += ["--max-num-batched-tokens", str(config.MAX_NUM_BATCHED_TOKENS)]
     if config.KV_CACHE_DTYPE != "auto":
@@ -341,10 +343,10 @@ def build_argv(vllm_bin: str, model_path: Path, model_cfg: dict[str, Any]) -> li
     # 启动日志
     log(f"模型：{config.MODEL_ID}（实际加载：{model_path}）")
     log(f"加载地址：{model_utils.effective_model_url()}（ONLINE_LOAD={config.ONLINE_LOAD}）")
-    log(f"GPU：CUDA_VISIBLE_DEVICES={','.join(map(str, config.GPU_IDS))}，TP={tp}")
+    log(f"GPU：{replica.gpu.uuid if replica else config.GPU_IDS}，TP={tp}，seqs={seqs}")
     log(
         f"max_model_len={max_len}（模型原生：{model_utils.native_max_model_len(model_cfg)}），"
-        f"gpu_memory_utilization={config.GPU_MEMORY_UTILIZATION}"
+        f"gpu_memory_utilization={utilization}，dtype={dtype}"
     )
     kv_bytes = model_utils.estimate_kv_bytes_per_token(model_cfg)
     if kv_bytes and max_len:
@@ -386,41 +388,85 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    vllm_bin = find_vllm_bin()
     validate_config()
-    validate_gpu_ids()
-    validate_port()
+    if not args.dry_run:
+        validate_port()
 
     log(f"服务地址：http://{config.HOST}:{config.PORT}")
     log(f"模型加载点：{model_utils.effective_model_url()}")
     model_path = model_utils.resolve_model_path()
     model_cfg = model_utils.read_model_config(model_path)
-    argv = build_argv(vllm_bin, model_path, model_cfg)
-    env = build_env()
-
+    try:
+        child_env = build_env()
+        resources = gpu_planner.estimate_resources(model_path, model_cfg, env=child_env)
+        decisions = gpu_planner.plan_replicas(gpu_planner.discover_gpus(), resources,
+                                             visibility_env=child_env)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise SystemExit(f"GPU/模型准入失败：{exc}") from exc
+    log(f"模型估算：weights={resources.weights_bytes / 1024**3:.2f} GiB ({resources.weight_source})，"
+        f"dtype={resources.dtype}，KV={resources.kv_bytes_per_token} bytes/token，"
+        f"state={resources.state_bytes_per_seq / 1024**2:.1f} MiB/seq")
+    eligible = [d for d in decisions if d.eligible]
+    for d in decisions:
+        log(f"GPU {d.gpu.index} {d.gpu.name} SM{d.gpu.compute_capability} "
+            f"free/total={d.gpu.free_bytes / 1024**3:.1f}/{d.gpu.total_bytes / 1024**3:.1f} GiB："
+            f"{'使用' if d.eligible else '跳过'}，seqs={d.max_num_seqs}，"
+            f"utilization={d.memory_utilization}，{d.reason}")
+    if not eligible:
+        raise SystemExit("没有符合当前模型精度/上下文要求的 GPU；请查看逐卡原因")
+    ports = range(config.BACKEND_PORT_START, config.BACKEND_PORT_START + len(eligible))
+    if ports[-1] > 65535 or config.PORT in ports:
+        raise SystemExit("副本端口超界或与 PORT 冲突，请调整 BACKEND_PORT_START")
+    vllm_bin = "vllm" if args.dry_run else find_vllm_bin()
     if args.dry_run:
-        print("\n=== 环境变量（敏感项已打码）===")
-        for key in sorted(redact_env(env)):
-            if key in {
-                "CUDA_VISIBLE_DEVICES",
-                "HF_ENDPOINT",
-                "HF_HOME",
-                "HF_HUB_CACHE",
-                "HF_HUB_OFFLINE",
-                "TRANSFORMERS_OFFLINE",
-                "VLLM_USE_RUST_FRONTEND",
-                "VLLM_ENABLE_CUDA_COMPATIBILITY",
-                "VLLM_CUDA_COMPATIBILITY_PATH",
-                "LD_LIBRARY_PATH",
-            }:
-                print(f"{key}={redact_env(env)[key]}")
-        print("\n=== vllm 命令 ===")
-        print(shlex.join(redact_argv(argv)))
+        for d, port in zip(eligible, ports):
+            argv = build_argv(vllm_bin, model_path, model_cfg, replica=d, port=port,
+                              resolved_dtype=resources.dtype)
+            print(f"CUDA_VISIBLE_DEVICES={d.gpu.uuid} " + shlex.join(redact_argv(argv)))
         return
+    raise SystemExit(asyncio.run(serve(decisions, vllm_bin, model_path, model_cfg, resources.dtype)))
 
-    log("启动 vLLM：")
-    print(f"  {shlex.join(redact_argv(argv))}", file=sys.stderr, flush=True)
-    os.execvpe(vllm_bin, argv, env)
+
+async def serve(decisions, vllm_bin, model_path, model_cfg, resolved_dtype: str) -> int:
+    from aiohttp import web
+    from gateway import create_app
+    from replica_manager import ReplicaManager
+
+    manager = ReplicaManager(decisions,
+        lambda d, port: build_argv(vllm_bin, model_path, model_cfg, replica=d, port=port,
+                                   resolved_dtype=resolved_dtype),
+        lambda d: build_env(replica=d), log_dir=ROOT / "logs", port_start=config.BACKEND_PORT_START,
+        startup_timeout=config.REPLICA_STARTUP_TIMEOUT, health_interval=config.REPLICA_HEALTH_INTERVAL,
+        health_timeout=config.REPLICA_HEALTH_TIMEOUT, shutdown_timeout=config.REPLICA_SHUTDOWN_TIMEOUT,
+        api_key=config.API_KEY)
+    app = create_app(manager.pool, api_key=config.API_KEY, status_provider=manager.status,
+                     connect_timeout=config.PROXY_CONNECT_TIMEOUT, read_timeout=config.PROXY_READ_TIMEOUT,
+                     max_body_mib=config.PROXY_MAX_BODY_MIB)
+    runner = web.AppRunner(app, handler_cancellation=True, shutdown_timeout=config.REPLICA_SHUTDOWN_TIMEOUT)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    previous = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous[sig] = signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
+    waiters = []
+    try:
+        await runner.setup()
+        await web.TCPSite(runner, config.HOST, config.PORT).start()
+        await manager.start()
+        waiters = [asyncio.create_task(stop.wait()), asyncio.create_task(manager.all_failed.wait())]
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        return 1 if manager.all_failed.is_set() else 0
+    finally:
+        manager.pool.accepting = False
+        for task in waiters:
+            task.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+        try:
+            await runner.cleanup()
+        finally:
+            await manager.close()
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
