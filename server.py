@@ -116,12 +116,17 @@ def validate_config() -> None:
     if isinstance(config.MAX_MODEL_LEN, str) and config.MAX_MODEL_LEN != "auto":
         raise SystemExit(f"config.MAX_MODEL_LEN 必须是正整数或 'auto'，当前为 {config.MAX_MODEL_LEN!r}")
 
-    for name in ("MAX_NUM_SEQS", "MIN_NUM_SEQS", "MAX_NUM_BATCHED_TOKENS", "PROXY_MAX_BODY_MIB"):
+    for name in ("MAX_NUM_SEQS", "MIN_NUM_SEQS", "PROXY_MAX_BODY_MIB"):
         value = getattr(config, name, None)
-        if value is None and name == "MAX_NUM_BATCHED_TOKENS":
-            continue
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise SystemExit(f"config.{name} 必须是正整数或 None，当前为 {value!r}")
+            raise SystemExit(f"config.{name} 必须是正整数，当前为 {value!r}")
+    # 只有单批 token 预算允许 None（不向 vLLM 传该参数）；副本规划必须有明确的
+    # MAX_NUM_SEQS 数值，None 会在 sequence_candidates/准入阶段再次崩掉。
+    value = config.MAX_NUM_BATCHED_TOKENS
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+    ):
+        raise SystemExit(f"config.MAX_NUM_BATCHED_TOKENS 必须是正整数或 None，当前为 {value!r}")
 
     if config.MIN_NUM_SEQS > config.MAX_NUM_SEQS:
         raise SystemExit("MIN_NUM_SEQS 不能超过 MAX_NUM_SEQS")
