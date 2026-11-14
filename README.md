@@ -66,8 +66,7 @@ model_service/
 │   ├── batch_chat.py         # 并发批处理（多输入 / 每输入 n 个候选）
 │   ├── smoke_test.sh         # /health + /v1/models + 一次 chat
 │   └── fetch_cuda_compat.sh  # 可选：无 sudo 解压 cuda-compat-12-9
-├── deployment_tests/         # 资源规划、真实 HTTP/子进程集成测试（无需 GPU）
-├── tests/                    # 本机历史测试（被 .gitignore 忽略）
+├── tests/                    # 本机历史测试（被 .gitignore 忽略；仓库不跟踪）
 ├── logs/                     # 运行日志（自动创建）
 └── run/                      # PID 文件（自动创建）
 ```
@@ -588,10 +587,10 @@ journalctl --user -u qwen38 -f
 
 ### 验证改造
 
-无需 GPU 的回归与真实本机 HTTP/子进程测试：
+无需 GPU 的本机单元测试（`tests/` 默认不纳入 git；若本机保留了该目录）：
 
 ```bash
-.venv/bin/python -m unittest discover -s deployment_tests -v
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 目标服务器维护窗口：
