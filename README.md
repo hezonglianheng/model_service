@@ -326,7 +326,7 @@ print(resp.choices[0].message.content)
 ```bash
 .venv/bin/python scripts/chat.py "写一个快速排序"
 .venv/bin/python scripts/chat.py --stream --no-thinking "写一个快速排序"
-.venv/bin/python scripts/chat.py --reasoning-effort high "证明根号 2 是无理数"
+.venv/bin/python scripts/chat.py --reasoning-effort medium "证明根号 2 是无理数"
 .venv/bin/python scripts/chat.py --image ./cat.jpg "描述这张图片"
 ```
 

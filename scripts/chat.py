@@ -5,7 +5,7 @@
     .venv/bin/python scripts/chat.py "用一句话解释什么是张量并行"
     .venv/bin/python scripts/chat.py --stream --no-thinking "写一个快速排序"
     .venv/bin/python scripts/chat.py --image ./cat.jpg "描述这张图片"
-    .venv/bin/python scripts/chat.py --reasoning-effort high "证明根号2是无理数"
+    .venv/bin/python scripts/chat.py --reasoning-effort medium "证明根号2是无理数"
 """
 
 from __future__ import annotations
